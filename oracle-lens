@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""
+Oracle Lens — 照亮你系统里的字体
+
+Usage:
+    oracle-lens             列出全部字体
+    oracle-lens <关键词>    搜索字体
+
+依赖：Python 3，fontconfig（fc-list）
+"""
+
+import subprocess
+import sys
+import os
+from collections import defaultdict
+
+FCLIST_CMD = ["fc-list", "--format=%{family}\n%{style}\n%{file}\n%{lang}\n---\n"]
+
+
+def run_fc_list():
+    try:
+        result = subprocess.run(FCLIST_CMD, capture_output=True, text=True, timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        print("错误: 需要 fontconfig（fc-list）", file=sys.stderr)
+        sys.exit(1)
+    return result.stdout
+
+
+def clean_style(raw):
+    """清理样式字段中的别名，去重"""
+    parts = [s.strip() for s in raw.split(",") if s.strip()]
+    seen = set()
+    result = []
+    for p in parts:
+        norm = p.lower()
+        if norm not in seen:
+            seen.add(norm)
+            result.append(p)
+    return result
+
+
+def get_primary_family(raw):
+    """取第一个全英文的家族名作为显示名"""
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    # 偏好纯英文名（大部分字符是 ASCII）
+    for name in names:
+        ascii_chars = sum(1 for c in name if c.isascii() and c.isalpha())
+        total_alpha = sum(1 for c in name if c.isalpha())
+        if total_alpha > 0 and ascii_chars / total_alpha > 0.8:
+            return name
+    return names[0] if names else raw
+
+
+def get_config_name(raw):
+    """取适合写进配置文件的字体名（短、纯英文、不带 weight 后缀）"""
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    # 去掉包含 weight 后缀（如 ExtraLight、SemiBold 等）的别名
+    weight_keywords = ["extra", "semi", "thin", "light", "medium", "bold", "black", "heavy"]
+    candidates = []
+    for name in names:
+        name_lower = name.lower()
+        if not any(w in name_lower for w in weight_keywords):
+            candidates.append(name)
+
+    # 从候选里挑纯英文名
+    for name in candidates:
+        ascii_count = sum(1 for c in name if c.isascii() and (c.isalpha() or c.isspace() or c in "-.'"))
+        if ascii_count / len(name) > 0.8:
+            return name
+
+    # 兜底：取最短的英文名
+    for name in names:
+        ascii_count = sum(1 for c in name if c.isascii() and (c.isalpha() or c.isspace() or c in "-.'"))
+        if ascii_count / len(name) > 0.8:
+            return name
+    return names[0] if names else raw
+
+
+def get_all_family_names(raw):
+    """返回所有家族名（用于搜索匹配）"""
+    return [n.strip() for n in raw.split(",") if n.strip()]
+
+
+def parse_fc_output(raw):
+    fonts = []
+    blocks = raw.strip().split("---\n")
+    for block in blocks:
+        lines = block.strip().split("\n")
+        if len(lines) < 3:
+            continue
+        family_raw = lines[0]
+        style_raw = lines[1]
+        path = lines[2]
+        lang_raw = lines[3] if len(lines) > 3 else ""
+
+        fonts.append({
+            "family": get_primary_family(family_raw),
+            "config_name": get_config_name(family_raw),
+            "all_names": get_all_family_names(family_raw),
+            "styles": clean_style(style_raw),
+            "path": path,
+            "lang": lang_raw,
+        })
+    return fonts
+
+
+def group_by_family(fonts):
+    groups = defaultdict(lambda: {"styles": set(), "langs": set(), "paths": set(), "all_names": set(), "config_names": set()})
+    for f in fonts:
+        g = groups[f["family"]]
+        for s in f["styles"]:
+            g["styles"].add(s)
+        if f["lang"]:
+            g["langs"].add(f["lang"])
+        g["paths"].add(f["path"])
+        for n in f["all_names"]:
+            g["all_names"].add(n)
+        g["config_names"].add(f["config_name"])
+    return groups
+
+
+def summarize_lang(langs_str):
+    """从 lang 字段提取可读的语言摘要"""
+    if not langs_str or langs_str == "none":
+        return ""
+
+    all_codes = set()
+    for raw in langs_str:
+        for code in raw.split("|"):
+            code = code.strip()
+            if code and code != "none":
+                all_codes.add(code)
+
+    # 只显示用户关心的主要语言
+    key_langs = {
+        "zh": "中文", "zh-cn": "简体中文", "zh-tw": "繁体中文", "zh-hk": "粤语",
+        "ja": "日文", "ko": "韩文",
+        "en": "英文", "fr": "法文", "de": "德文", "ru": "俄文",
+        "ar": "阿拉伯文", "he": "希伯来文", "th": "泰文", "vi": "越南文",
+    }
+
+    found = []
+    other_count = 0
+    for code in sorted(all_codes):
+        if code in key_langs:
+            found.append(key_langs[code])
+        else:
+            other_count += 1
+
+    # 去重
+    seen = set()
+    result = []
+    for l in found:
+        if l not in seen:
+            seen.add(l)
+            result.append(l)
+
+    if other_count > 0:
+        result.append(f"等 {other_count} 种")
+
+    return " / ".join(result) if result else ""
+
+
+def family_dir(paths):
+    for p in paths:
+        if "/" in p:
+            d = p.rsplit("/", 1)[0] + "/"
+            # 缩短 home 路径
+            home = os.path.expanduser("~")
+            if d.startswith(home):
+                d = "~" + d[len(home):]
+            return d
+    return ""
+
+
+def match_font(family, all_names, styles, langs, query_words):
+    text = f"{family} {' '.join(all_names)} {' '.join(styles)} {langs}".lower()
+    return all(w.lower() in text for w in query_words)
+
+
+def display(fonts, query_words=None):
+    groups = group_by_family(fonts)
+
+    if query_words:
+        matched = {
+            k: v for k, v in groups.items()
+            if match_font(k, v["all_names"], v["styles"],
+                          "|".join(v["langs"]), query_words)
+        }
+    else:
+        matched = groups
+
+    keys = sorted(matched.keys())
+
+    if not keys:
+        q = " ".join(query_words) if query_words else ""
+        print(f"🔍 没有找到匹配「{q}」的字体")
+        return
+
+    print(f"找到 {len(keys)} 个字体:\n")
+    for family in keys:
+        g = matched[family]
+        styles = sorted(g["styles"], key=lambda s: (
+            # 排序：Regular 排最前，然后 Bold/Italic，其他按字母
+            0 if s == "Regular" else 1 if s in ("Bold", "Italic", "Bold Italic") else 2,
+            s,
+        ))
+        lang = summarize_lang(g["langs"])
+        dir_path = family_dir(g["paths"])
+
+        # 样式显示：如果太多就缩写
+        style_display = ", ".join(styles)
+        if len(style_display) > 60:
+            # 合并精简
+            short = [s for s in styles if s in ("Regular", "Bold", "Italic", "Bold Italic",
+                     "SemiBold", "ExtraLight", "Light", "Thin", "Medium")]
+            style_display = ", ".join(short) if short else styles[0]
+
+        # 配置名（用于 kitty / CSS / fontconfig 等）
+        config_names = g.get("config_names", set())
+        config_name = ""
+        if config_names:
+            best = min(config_names, key=len)
+            if best != family:
+                config_name = best
+
+        print(f"  {family}")
+        if config_name:
+            print(f"    ├ 配置: {config_name}")
+        if style_display:
+            print(f"    ├ 样式: {style_display}")
+        if dir_path:
+            print(f"    ├ 路径: {dir_path}")
+        if lang:
+            print(f"    └ 语言: {lang}")
+        print()
+
+    print(f"共 {len(keys)} 个字体")
+
+
+def main():
+    raw = run_fc_list()
+    fonts = parse_fc_output(raw)
+
+    query_words = sys.argv[1:] if len(sys.argv) > 1 else None
+    display(fonts, query_words)
+
+
+if __name__ == "__main__":
+    main()
