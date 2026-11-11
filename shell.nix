@@ -3,5 +3,8 @@
 }:
 
 pkgs.mkShell {
-  buildImputs = [ pkgs.python3 ];
+  buildInputs = [
+    pkgs.python3
+    pkgs.nushell
+  ];
 }
